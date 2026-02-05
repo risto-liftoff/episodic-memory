@@ -19544,7 +19544,7 @@ var SearchInputSchema = external_exports.object({
   )
 }).strict();
 var ShowConversationInputSchema = external_exports.object({
-  path: external_exports.string().min(1, "Path is required").describe("Absolute path to the JSONL conversation file to display"),
+  path: external_exports.string().min(1, "Path is required").describe("Path to the JSONL conversation file to display. For security, must be inside the episodic-memory archive directory."),
   startLine: external_exports.number().int().min(1).optional().describe("Starting line number (1-indexed, inclusive). Omit to start from beginning."),
   endLine: external_exports.number().int().min(1).optional().describe("Ending line number (1-indexed, inclusive). Omit to read to end.")
 }).strict();
@@ -19553,6 +19553,32 @@ function handleError(error2) {
     return `Error: ${error2.message}`;
   }
   return `Error: ${String(error2)}`;
+}
+function getArchiveDir() {
+  if (process.env.TEST_ARCHIVE_DIR) {
+    return ensureDir(process.env.TEST_ARCHIVE_DIR);
+  }
+  return ensureDir(path.join(getSuperpowersDir(), "conversation-archive"));
+}
+function resolveConversationPath(inputPath) {
+  const archiveRoot = fs4.realpathSync(getArchiveDir());
+  const candidate = path.isAbsolute(inputPath) ? path.resolve(inputPath) : path.resolve(archiveRoot, inputPath);
+  if (!candidate.toLowerCase().endsWith(".jsonl")) {
+    throw new Error("Invalid path: only .jsonl conversation files may be read.");
+  }
+  const rel = path.relative(archiveRoot, candidate);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw new Error(`Access denied: path must be under archive dir: ${archiveRoot}`);
+  }
+  if (!fs4.existsSync(candidate)) {
+    throw new Error(`File not found: ${candidate}`);
+  }
+  const real = fs4.realpathSync(candidate);
+  const relReal = path.relative(archiveRoot, real);
+  if (relReal.startsWith("..") || path.isAbsolute(relReal)) {
+    throw new Error(`Access denied: resolved path escapes archive dir: ${archiveRoot}`);
+  }
+  return real;
 }
 var server = new Server(
   {
@@ -19603,7 +19629,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            path: { type: "string", minLength: 1 },
+            path: { type: "string", minLength: 1, description: "Path to a JSONL conversation file inside the episodic-memory archive directory." },
             startLine: { type: "number", minimum: 1 },
             endLine: { type: "number", minimum: 1 }
           },
@@ -19684,10 +19710,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     if (name === "read") {
       const params = ShowConversationInputSchema.parse(args);
-      if (!fs4.existsSync(params.path)) {
-        throw new Error(`File not found: ${params.path}`);
-      }
-      const jsonlContent = fs4.readFileSync(params.path, "utf-8");
+      const conversationPath = resolveConversationPath(params.path);
+      const jsonlContent = fs4.readFileSync(conversationPath, "utf-8");
       const markdownContent = formatConversationAsMarkdown(
         jsonlContent,
         params.startLine,

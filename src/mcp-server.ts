@@ -22,6 +22,8 @@ import {
 } from './search.js';
 import { formatConversationAsMarkdown } from './show.js';
 import fs from 'fs';
+import path from 'path';
+import { getArchiveDir } from './paths.js';
 
 // Zod Schemas for Input Validation
 
@@ -74,7 +76,9 @@ const ShowConversationInputSchema = z
     path: z
       .string()
       .min(1, 'Path is required')
-      .describe('Absolute path to the JSONL conversation file to display'),
+      .describe(
+        'Path to the JSONL conversation file to display. For security, must be inside the episodic-memory archive directory.'
+      ),
     startLine: z
       .number()
       .int()
@@ -99,6 +103,36 @@ function handleError(error: unknown): string {
     return `Error: ${error.message}`;
   }
   return `Error: ${String(error)}`;
+}
+
+function resolveConversationPath(inputPath: string): string {
+  const archiveRoot = fs.realpathSync(getArchiveDir());
+  const candidate = path.isAbsolute(inputPath)
+    ? path.resolve(inputPath)
+    : path.resolve(archiveRoot, inputPath);
+
+  if (!candidate.toLowerCase().endsWith('.jsonl')) {
+    throw new Error('Invalid path: only .jsonl conversation files may be read.');
+  }
+
+  // Enforce that the resolved path is under archiveRoot (prevents ../ escapes).
+  const rel = path.relative(archiveRoot, candidate);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error(`Access denied: path must be under archive dir: ${archiveRoot}`);
+  }
+
+  if (!fs.existsSync(candidate)) {
+    throw new Error(`File not found: ${candidate}`);
+  }
+
+  // Resolve symlinks and enforce again to prevent symlink escapes.
+  const real = fs.realpathSync(candidate);
+  const relReal = path.relative(archiveRoot, real);
+  if (relReal.startsWith('..') || path.isAbsolute(relReal)) {
+    throw new Error(`Access denied: resolved path escapes archive dir: ${archiveRoot}`);
+  }
+
+  return real;
 }
 
 // Create MCP Server
@@ -155,7 +189,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
-            path: { type: 'string', minLength: 1 },
+            path: {
+              type: 'string',
+              minLength: 1,
+              description: 'Path to a JSONL conversation file inside the episodic-memory archive directory.'
+            },
             startLine: { type: 'number', minimum: 1 },
             endLine: { type: 'number', minimum: 1 },
           },
@@ -251,13 +289,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (name === 'read') {
       const params = ShowConversationInputSchema.parse(args);
 
-      // Verify file exists
-      if (!fs.existsSync(params.path)) {
-        throw new Error(`File not found: ${params.path}`);
-      }
+      const conversationPath = resolveConversationPath(params.path);
 
       // Read and format conversation with optional line range
-      const jsonlContent = fs.readFileSync(params.path, 'utf-8');
+      const jsonlContent = fs.readFileSync(conversationPath, 'utf-8');
       const markdownContent = formatConversationAsMarkdown(
         jsonlContent,
         params.startLine,
